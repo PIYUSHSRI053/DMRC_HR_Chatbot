@@ -1,0 +1,14 @@
+streamlit
+pypdf
+sentence-transformers
+scikit-learn
+gensim
+google-generativeai
+numpy
+nltk
+rank_bm25
+joblib
+python-dotenv
+tqdm
+torch
+faiss-cpu

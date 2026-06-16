@@ -1,0 +1,229 @@
+import os, re, sys, time, types, joblib
+import numpy as np
+import streamlit as st
+from nltk.corpus import stopwords
+from nltk.tokenize import word_tokenize
+from sklearn.metrics.pairwise import cosine_similarity
+import nltk
+from dotenv import load_dotenv
+
+load_dotenv()
+nltk.download("punkt", quiet=True)
+nltk.download("punkt_tab", quiet=True)
+nltk.download("stopwords", quiet=True)
+
+try:
+    import google.generativeai as genai
+except ImportError:
+    genai = None
+
+try:
+    from sentence_transformers import CrossEncoder
+except ImportError:
+    CrossEncoder = None
+
+try:
+    from rank_bm25 import BM25Okapi
+    BM25_SHIM_ACTIVE = False
+except ImportError:
+    BM25_SHIM_ACTIVE = True
+    class BM25Okapi:
+        def __init__(self, corpus=None, tokenizer=None, k1=1.5, b=0.75, epsilon=0.25):
+            self.corpus_size=0; self.avgdl=0.0; self.doc_freqs=[]; self.idf={}; self.doc_len=[]; self.k1=k1; self.b=b
+        def get_scores(self, query):
+            if not self.corpus_size: return np.array([])
+            score=np.zeros(self.corpus_size); dl=np.array(self.doc_len); avg=self.avgdl or 1.0
+            for t in query:
+                tf=np.array([(d.get(t) or 0) for d in self.doc_freqs])
+                score+=(self.idf.get(t) or 0.0)*(tf*(self.k1+1)/(tf+self.k1*(1-self.b+self.b*dl/avg)))
+            return score
+    mod=types.ModuleType("rank_bm25"); mod.BM25Okapi=BM25Okapi; sys.modules["rank_bm25"]=mod
+
+GEMINI_KEY   = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
+REQUIRED     = ["chatbot_model.pkl","chatbot_tfidf.pkl","chatbot_w2v.pkl","chatbot_data.pkl"]
+
+STOP_WORDS = set(stopwords.words("english"))
+
+CHAPTERS = {
+    "Z":"General Information & Foreword", "A":"General Conditions of Service",
+    "B":"Conduct & Discipline",           "C":"Pay & Allowances",
+    "D":"TA/DA Rules",                    "E":"Medical Rules",
+    "F":"Leave Rules",                    "G":"House Building Advance",
+    "H":"Vehicle Advance",                "I":"Multi-Purpose Advance",
+    "J":"Recruitment Rules",              "K":"Housing Allotment",
+    "L":"Staff Welfare",                  "M":"Post Retirement",
+    "N":"Leave Travel Concession",
+}
+
+DIRECT = [
+    (["managing director","md name","who is md","current md","vikas kumar","md of dmrc"],
+     "The Managing Director of DMRC is **Dr. Vikas Kumar**.\n_(Source: HR Compendium 2025, signed 4th August 2025, New Delhi)_"),
+    (["compendium date","when published","published date"],
+     "The HR Compendium 2025 was published on **4th August 2025**, signed by Dr. Vikas Kumar, MD, DMRC."),
+]
+
+QUESTIONS = [
+    "Who is the Managing Director of DMRC?","How many days of casual leave does an employee get?",
+    "What is the maternity leave duration?","Rules for earned leave encashment",
+    "What is the House Building Advance limit?","Interest rate on house building advance",
+    "Eligibility criteria for HBA","Medical attendance rules for retired employees",
+    "What allowances are paid to employees?","Dearness Allowance calculation",
+    "Rules for travelling allowance on tour","Daily allowance rates","Vehicle advance eligibility",
+    "Multi purpose advance amount","Recruitment process in DMRC","Housing allotment rules",
+    "Staff welfare fund usage","Post retirement contractual engagement",
+    "Leave Travel Concession entitlement","LTC for home town","Conduct rules for employees",
+    "Disciplinary action procedure","Appointment and confirmation rules",
+    "Performance appraisal process","Hours of work and holidays",
+]
+
+def tokenize(text):
+    try: tokens = word_tokenize(text.lower())
+    except: tokens = re.findall(r"[a-zA-Z]+", text.lower())
+    return [t for t in tokens if t.isalpha()]
+
+def build_context(results):
+    out = []
+    for i, (chunk, ch, score) in enumerate(results[:4], 1):
+        page = ""
+        m = re.search(rf'\b{re.escape(ch)}-(\d+)\b', str(chunk))
+        if m: page = f"\nPage ref: {ch}-{m.group(1)}"
+        out.append(f"Source {i}\nChapter: {ch} - {CHAPTERS.get(ch,'')} {page}\nSimilarity: {score:.2f}\nExcerpt: {' '.join(str(chunk).split())}")
+    return "\n\n".join(out)
+
+def ask_gemini(query, results):
+    if genai is None or not GEMINI_KEY:
+        if not results: return "No Gemini API key configured."
+        return "\n\n".join(f"**Chapter {ch}**: {c[:300]}..." for c,ch,_ in results[:2])
+    prompt = (
+        f"You are the DMRC HR assistant. Answer using HR manual excerpts below.\n\nQuestion:\n{query}\n\nHR manual excerpts:\n{build_context(results)}"
+        if results else
+        f"You are the DMRC HR assistant. Answer clearly.\n\nQuestion:\n{query}"
+    )
+    try:
+        genai.configure(api_key=GEMINI_KEY)
+        r = genai.GenerativeModel(GEMINI_MODEL).generate_content(prompt)
+        ans = getattr(r, "text", "").strip()
+        if ans: return ans
+    except Exception as e:
+        st.warning(f"Gemini error: {e}")
+    return "\n\n".join(f"**Chapter {ch}**: {c[:300]}..." for c,ch,_ in results[:2]) if results else "Could not generate answer."
+
+@st.cache_resource(show_spinner=False)
+def load_data():
+    if any(not os.path.exists(p) for p in REQUIRED): return None
+    import torch
+    _orig = torch.load
+    torch.load = lambda *a, **kw: _orig(*a, **{**kw, "map_location": "cpu"})
+    try:
+        r = {"st":joblib.load("chatbot_model.pkl"),"tfidf":joblib.load("chatbot_tfidf.pkl"),
+             "w2v":joblib.load("chatbot_w2v.pkl"),"data":joblib.load("chatbot_data.pkl")}
+    except Exception as e: st.error(f"Load error: {e}"); st.stop()
+    finally: torch.load = _orig
+    return r
+
+@st.cache_resource(show_spinner=False)
+def load_ce():
+    if CrossEncoder is None: return None
+    try: return CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+    except: return None
+
+def _st_scores(query, m):
+    embs=m["data"]["st_embeddings"].astype(np.float32)
+    qv=m["st"].encode([query],convert_to_numpy=True,normalize_embeddings=True)
+    norms=np.linalg.norm(embs,axis=1,keepdims=True); norms[norms==0]=1
+    return (qv@(embs/norms).T)[0]
+
+def _bm25_scores(query, m):
+    bm25=m["data"].get("bm25")
+    if bm25 is None: return None
+    toks=[t for t in tokenize(query) if t not in STOP_WORDS]
+    if not toks: return np.zeros(len(m["data"]["all_chunks"]))
+    s=bm25.get_scores(toks); mx=s.max() if s.max()>0 else 1.0; return s/mx
+
+def search(query, m, k=4, ce=None):
+   
+    q=query.lower()
+    for kws, ans in DIRECT:
+        if any(kw in q for kw in kws): return ans, None, None, []
+    chunks=m["data"]["all_chunks"]; meta=m["data"]["chunk_meta"]
+    st_s=_st_scores(query,m); bm25_s=_bm25_scores(query,m)
+    combined=0.55*st_s+0.45*bm25_s if bm25_s is not None else st_s
+    pool=np.argsort(combined)[::-1][:k*4]
+    cands=[(chunks[i],meta[i],float(combined[i])) for i in pool]
+    if ce:
+        try:
+            sc=ce.predict([(query,c[0]) for c in cands])
+            cands=[x[0] for x in sorted(zip(cands,sc),key=lambda x:x[1],reverse=True)[:k]]
+        except: cands=cands[:k]
+    else: cands=cands[:k]
+    score=cands[0][2] if cands else 0
+    threshold=float(m["data"].get("similarity_threshold",0.15))
+    use_pdf=cands and score>=threshold
+    answer=ask_gemini(query, cands if use_pdf else [])
+    chaps=list(dict.fromkeys(c[1] for c in cands))[:3] if use_pdf else None
+    return answer, score, chaps, cands
+
+st.set_page_config(page_title="DMRC HR Chatbot", page_icon="🚇", layout="centered")
+
+models = load_data()
+ce     = load_ce()
+
+with st.sidebar:
+    st.title("🚇 DMRC HR Bot")
+    st.markdown("---")
+    st.markdown("**Sample Questions**")
+    st.caption("Click to ask instantly")
+    for q in QUESTIONS:
+        if st.button(q, key=f"sq_{q}"):
+            st.session_state["pending"] = q
+    st.markdown("---")
+    if st.button("🗑 Clear chat"):
+        st.session_state.history = []; st.rerun()
+    if BM25_SHIM_ACTIVE:
+        st.caption("ℹ️ BM25 shim active (rank_bm25 not installed)")
+
+if models is None:
+    st.error("Missing .pkl files. Place all 4 next to app.py and restart."); st.stop()
+
+if "history"  not in st.session_state: st.session_state.history  = []
+if "pending"  not in st.session_state: st.session_state.pending  = None
+
+st.title("DMRC HR Assistant")
+st.caption("Ask questions about DMRC HR policies, leave, pay, advances, and more.")
+
+for role, msg in st.session_state.history:
+    st.chat_message(role).write(msg)
+
+query = st.chat_input("Example: How many days of casual leave am I entitled to?")
+
+if st.session_state.pending and not query:
+    query = st.session_state.pending
+    st.session_state.pending = None
+
+if query:
+    st.session_state.pending = None
+    st.chat_message("user").write(query)
+    with st.chat_message("assistant"):
+        with st.spinner("Searching HR Compendium..."):
+            t0 = time.time()
+            answer, score, chaps, cands = search(query, models, k=4, ce=ce)
+            elapsed = round(time.time()-t0, 2)
+        st.write(answer)
+        if chaps:
+            labels = []
+            for c in chaps:
+                page_ref = ""
+                for chunk, ch2, _ in cands:
+                    if ch2 == c:
+                        pm = re.search(rf'\b{re.escape(c)}-(\d+)\b', str(chunk))
+                        if pm: page_ref = f" (Page {c}-{pm.group(1)})"; break
+                labels.append(f"Chapter {c}: {CHAPTERS.get(c,'')}{page_ref}")
+            st.caption("📖 Source: " + "  |  ".join(labels) + f"  •  {elapsed}s")
+        elif score is None:
+            st.caption("📖 Source: HR Compendium 2025 — Foreword")
+        else:
+            st.caption(f"💬 General knowledge  •  {elapsed}s")
+    st.session_state.history.append(("user", query))
+    st.session_state.history.append(("assistant", answer))
+    st.rerun()

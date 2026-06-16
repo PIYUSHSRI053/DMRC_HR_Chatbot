@@ -1,0 +1,12 @@
+# Secret keys — NEVER commit this
+.env
+
+# Model files (too large for GitHub — share separately)
+*.pkl
+*.npy
+dmrc_cache/
+
+# Python
+__pycache__/
+*.pyc
+.DS_Store
