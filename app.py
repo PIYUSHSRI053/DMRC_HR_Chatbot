@@ -43,6 +43,26 @@ GEMINI_KEY   = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
 REQUIRED     = ["chatbot_model.pkl","chatbot_tfidf.pkl","chatbot_w2v.pkl","chatbot_data.pkl"]
 
+# Attempt to download the primary model file if it's missing. Uses the Google Drive file ID
+# you provided — change `CHATBOT_MODEL_FILE_ID` if a different file should be fetched.
+try:
+    import gdown
+except Exception:
+    gdown = None
+
+CHATBOT_MODEL_FILE_ID = "17GettyBRuqyOOhnIykDztpfNdXr3zhp9"
+CHATBOT_MODEL_FILENAME = "chatbot_model.pkl"
+
+if gdown is not None and not os.path.exists(CHATBOT_MODEL_FILENAME):
+    url = f"https://drive.google.com/uc?id={CHATBOT_MODEL_FILE_ID}"
+    try:
+        print(f"Downloading {CHATBOT_MODEL_FILENAME} from Google Drive...")
+        gdown.download(url, CHATBOT_MODEL_FILENAME, quiet=False)
+        if not os.path.exists(CHATBOT_MODEL_FILENAME):
+            print(f"Download failed: {CHATBOT_MODEL_FILENAME} still missing")
+    except Exception as e:
+        print(f"Could not download {CHATBOT_MODEL_FILENAME}: {e}")
+
 STOP_WORDS = set(stopwords.words("english"))
 
 CHAPTERS = {
