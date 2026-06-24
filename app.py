@@ -1,4 +1,6 @@
-import os, re, sys, time, types, joblib
+import os, re, sys, time, types, joblib, traceback
+from pathlib import Path
+
 import numpy as np
 import streamlit as st
 from nltk.corpus import stopwords
@@ -6,15 +8,24 @@ from nltk.tokenize import word_tokenize
 import nltk
 from dotenv import load_dotenv
 
-load_dotenv()
+# ── Load .env reliably, regardless of cwd ───────────────────────────────────
+# Looks next to this file first, then walks up — fixes the "key is blank
+# because streamlit was launched from a different folder" problem.
+_ENV_PATH = Path(__file__).resolve().parent / ".env"
+load_dotenv(dotenv_path=_ENV_PATH if _ENV_PATH.exists() else None)
+load_dotenv()  # fallback: also check cwd / default search
+
 nltk.download("punkt",     quiet=True)
 nltk.download("punkt_tab", quiet=True)
 nltk.download("stopwords", quiet=True)
 
+# ── New Gemini SDK (old google-generativeai is EOL as of Nov 30 2025) ──────
 try:
-    import google.generativeai as genai
+    from google import genai as genai_sdk
+    from google.genai import types as genai_types
 except ImportError:
-    genai = None
+    genai_sdk = None
+    genai_types = None
 
 try:
     from sentence_transformers import CrossEncoder
@@ -45,8 +56,10 @@ except ImportError:
     gdown = None
 
 # ── Config ────────────────────────────────────────────────────────────────────
-GEMINI_KEY   = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")  
+GEMINI_KEY   = os.getenv("GEMINI_API_KEY", "").strip()
+# gemini-3.5-flash is the current fast model as of mid-2026. Override via .env
+# if you need a different tier (e.g. GEMINI_MODEL=gemini-3.1-flash-lite).
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash").strip()
 
 # All 4 required files — chatbot_model.pkl downloaded from Drive if missing
 REQUIRED = [
@@ -56,7 +69,7 @@ REQUIRED = [
     "chatbot_data.pkl",
 ]
 
-# Google Drive file IDs — make each file public 
+# Google Drive file IDs — make each file public (Anyone with link → Viewer)
 DRIVE_FILES = {
     "chatbot_model.pkl" : "17GettyBRuqyOOhnIykDztpfNdXr3zhp9",
     "chatbot_tfidf.pkl" : "1pOtcIAew-2NDMoGFb3wUTFcAQ1drtNYS",
@@ -130,40 +143,77 @@ def build_context(results):
                    f"\nSimilarity: {score:.2f}\nExcerpt: {' '.join(str(chunk).split())}")
     return "\n\n".join(out)
 
+def _gemini_client():
+    """Lazily build a genai client. Returns (client, error_message)."""
+    if genai_sdk is None:
+        return None, ("google-genai package is not installed. Run:\n"
+                       "  pip install google-genai --break-system-packages")
+    if not GEMINI_KEY:
+        return None, (f"GEMINI_API_KEY is empty. Checked: {_ENV_PATH} "
+                       f"(exists={_ENV_PATH.exists()}) and current working directory. "
+                       "Make sure your .env file sits next to app.py and contains "
+                       "GEMINI_API_KEY=your_key_here with no quotes.")
+    try:
+        client = genai_sdk.Client(api_key=GEMINI_KEY)
+        return client, None
+    except Exception as e:
+        return None, f"Failed to create Gemini client: {e}"
+
 def ask_gemini(query, results):
-    if genai is None or not GEMINI_KEY:
-        if not results: return "No Gemini API key configured."
-        return "\n\n".join(f"**Chapter {ch}**: {c[:300]}..." for c,ch,_ in results[:2])
+    """
+    Returns (answer_text, error_text_or_None).
+    error_text is shown to the user AND kept so st.rerun() doesn't hide it.
+    """
+    client, err = _gemini_client()
+    if client is None:
+        if not results:
+            return "No Gemini API key configured.", err
+        fallback = "\n\n".join(f"**Chapter {ch}**: {c[:300]}..." for c, ch, _ in results[:2])
+        return fallback, err
+
     prompt = (
         f"You are the DMRC HR assistant. Answer using HR manual excerpts below.\n\n"
         f"Question:\n{query}\n\nHR manual excerpts:\n{build_context(results)}"
         if results else
         f"You are the DMRC HR assistant. Answer clearly.\n\nQuestion:\n{query}"
     )
+
     try:
-        genai.configure(api_key=GEMINI_KEY)
-        r   = genai.GenerativeModel(GEMINI_MODEL).generate_content(prompt)
-        ans = getattr(r, "text", "").strip()
-        if ans: return ans
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+        )
+        ans = (getattr(response, "text", "") or "").strip()
+        if ans:
+            return ans, None
+
+        # No exception, but also no text — surface *why* instead of guessing.
+        finish_reason = None
+        try:
+            finish_reason = response.candidates[0].finish_reason
+        except Exception:
+            pass
+        err = f"Gemini returned an empty response (finish_reason={finish_reason})."
     except Exception as e:
-        st.warning(f"Gemini error: {e}")
-    return "\n\n".join(f"**Chapter {ch}**: {c[:300]}..." for c,ch,_ in results[:2]) if results else "Could not generate answer."
+        err = f"Gemini error [{type(e).__name__}]: {e}"
+
+    if results:
+        fallback = "\n\n".join(f"**Chapter {ch}**: {c[:300]}..." for c, ch, _ in results[:2])
+        return fallback, err
+    return "Could not generate answer.", err
 
 # ── Loaders ───────────────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner=False)
 def load_data():
-    # Download any missing files from Google Drive
     for filename, file_id in DRIVE_FILES.items():
         if not os.path.exists(filename):
             _download_from_drive(filename, file_id)
 
-    # Check all required files are present
     missing = [f for f in REQUIRED if not os.path.exists(f)]
     if missing:
         st.error(f"Missing files: {missing}\nPlace them next to app.py or add their Drive IDs to DRIVE_FILES.")
         st.stop()
 
-    # Force CPU loading (fixes CUDA→CPU error)
     import torch
     _orig = torch.load
     torch.load = lambda *a, **kw: _orig(*a, **{**kw, "map_location": "cpu"})
@@ -204,7 +254,7 @@ def _bm25_scores(query, m):
 def search(query, m, k=4, ce=None):
     q = query.lower()
     for kws, ans in DIRECT:
-        if any(kw in q for kw in kws): return ans, None, None, []
+        if any(kw in q for kw in kws): return ans, None, None, [], None
 
     chunks, meta = m["data"]["all_chunks"], m["data"]["chunk_meta"]
     st_s   = _st_scores(query, m)
@@ -223,9 +273,9 @@ def search(query, m, k=4, ce=None):
     score     = cands[0][2] if cands else 0
     threshold = float(m["data"].get("similarity_threshold", 0.15))
     use_pdf   = cands and score >= threshold
-    answer    = ask_gemini(query, cands if use_pdf else [])
+    answer, gemini_err = ask_gemini(query, cands if use_pdf else [])
     chaps     = list(dict.fromkeys(c[1] for c in cands))[:3] if use_pdf else None
-    return answer, score, chaps, cands
+    return answer, score, chaps, cands, gemini_err
 
 # ── UI ────────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="DMRC HR Chatbot", page_icon="🚇", layout="centered")
@@ -247,6 +297,26 @@ with st.sidebar:
     if BM25_SHIM_ACTIVE:
         st.caption("ℹ️ BM25 shim active (rank_bm25 not installed)")
 
+    # Diagnostics — shows immediately whether the key/SDK/model setup is sane,
+    # without needing to send a chat message first.
+    with st.expander("🔧 Gemini diagnostics"):
+        st.write("**.env path checked:**", str(_ENV_PATH))
+        st.write("**.env exists:**", _ENV_PATH.exists())
+        st.write("**API key loaded:**", "Yes" if GEMINI_KEY else "❌ No / empty")
+        st.write("**Model:**", GEMINI_MODEL)
+        st.write("**google-genai installed:**", genai_sdk is not None)
+        if st.button("Run test call"):
+            client, err = _gemini_client()
+            if err:
+                st.error(err)
+            else:
+                try:
+                    test = client.models.generate_content(model=GEMINI_MODEL, contents="Say OK")
+                    st.success(f"Success: {getattr(test, 'text', test)!r}")
+                except Exception as e:
+                    st.error(f"{type(e).__name__}: {e}")
+                    st.code(traceback.format_exc())
+
 if models is None:
     st.error("Missing .pkl files. Place all 4 next to app.py and restart."); st.stop()
 
@@ -256,8 +326,14 @@ if "pending" not in st.session_state: st.session_state.pending = None
 st.title("DMRC HR Assistant")
 st.caption("Ask questions about DMRC HR policies, leave, pay, advances, and more.")
 
-for role, msg in st.session_state.history:
-    st.chat_message(role).write(msg)
+# History entries are (role, msg, error_or_None) so warnings survive st.rerun().
+for entry in st.session_state.history:
+    role, msg = entry[0], entry[1]
+    err = entry[2] if len(entry) > 2 else None
+    with st.chat_message(role):
+        st.write(msg)
+        if err:
+            st.warning(err)
 
 query = st.chat_input("Example: How many days of casual leave am I entitled to?")
 
@@ -271,9 +347,11 @@ if query:
     with st.chat_message("assistant"):
         with st.spinner("Searching HR Compendium..."):
             t0 = time.time()
-            answer, score, chaps, cands = search(query, models, k=4, ce=ce)
+            answer, score, chaps, cands, gemini_err = search(query, models, k=4, ce=ce)
             elapsed = round(time.time()-t0, 2)
         st.write(answer)
+        if gemini_err:
+            st.warning(gemini_err)
         if chaps:
             labels = []
             for c in chaps:
@@ -288,6 +366,6 @@ if query:
             st.caption("📖 Source: HR Compendium 2025 — Foreword")
         else:
             st.caption(f"💬 General knowledge  •  {elapsed}s")
-    st.session_state.history.append(("user", query))
-    st.session_state.history.append(("assistant", answer))
+    st.session_state.history.append(("user", query, None))
+    st.session_state.history.append(("assistant", answer, gemini_err))
     st.rerun()
