@@ -56,10 +56,26 @@ except ImportError:
     gdown = None
 
 # ── Config ────────────────────────────────────────────────────────────────────
-GEMINI_KEY   = os.getenv("GEMINI_API_KEY", "").strip()
-# gemini-3.5-flash is the current fast model as of mid-2026. Override via .env
-# if you need a different tier (e.g. GEMINI_MODEL=gemini-3.1-flash-lite).
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash").strip()
+def _get_secret(key, default=""):
+    """
+    Reads config from, in order:
+      1. st.secrets (Streamlit Community Cloud's Secrets Manager — set this
+         under App settings → Secrets as KEY = "value" in TOML format)
+      2. os.environ (.env file, for local dev)
+    This makes the same code work both locally and on Streamlit Cloud,
+    where .env files are NOT deployed and do not exist on the server.
+    """
+    try:
+        if key in st.secrets:
+            return str(st.secrets[key]).strip()
+    except Exception:
+        pass  # st.secrets raises if no secrets.toml exists at all (local dev) — that's fine
+    return os.getenv(key, default).strip()
+
+GEMINI_KEY   = _get_secret("GEMINI_API_KEY", "")
+# gemini-3.5-flash is the current fast model as of mid-2026. Override via
+# Streamlit secrets / .env if you need a different tier.
+GEMINI_MODEL = _get_secret("GEMINI_MODEL", "gemini-3.5-flash")
 
 # All 4 required files — chatbot_model.pkl downloaded from Drive if missing
 REQUIRED = [
@@ -149,10 +165,11 @@ def _gemini_client():
         return None, ("google-genai package is not installed. Run:\n"
                        "  pip install google-genai --break-system-packages")
     if not GEMINI_KEY:
-        return None, (f"GEMINI_API_KEY is empty. Checked: {_ENV_PATH} "
-                       f"(exists={_ENV_PATH.exists()}) and current working directory. "
-                       "Make sure your .env file sits next to app.py and contains "
-                       "GEMINI_API_KEY=your_key_here with no quotes.")
+        return None, ("GEMINI_API_KEY is empty.\n"
+                       "• On Streamlit Cloud: set it under App settings → Secrets as "
+                       'GEMINI_API_KEY = "your_key_here" (TOML format), then reboot the app.\n'
+                       f"• Locally: checked {_ENV_PATH} (exists={_ENV_PATH.exists()}) "
+                       "— make sure GEMINI_API_KEY=your_key_here is in that file with no quotes.")
     try:
         client = genai_sdk.Client(api_key=GEMINI_KEY)
         return client, None
@@ -300,7 +317,12 @@ with st.sidebar:
     # Diagnostics — shows immediately whether the key/SDK/model setup is sane,
     # without needing to send a chat message first.
     with st.expander("🔧 Gemini diagnostics"):
-        st.write("**.env path checked:**", str(_ENV_PATH))
+        try:
+            in_secrets = "GEMINI_API_KEY" in st.secrets
+        except Exception:
+            in_secrets = False
+        st.write("**Found in st.secrets:**", in_secrets)
+        st.write("**.env path checked (local dev only):**", str(_ENV_PATH))
         st.write("**.env exists:**", _ENV_PATH.exists())
         st.write("**API key loaded:**", "Yes" if GEMINI_KEY else "❌ No / empty")
         st.write("**Model:**", GEMINI_MODEL)
@@ -369,3 +391,4 @@ if query:
     st.session_state.history.append(("user", query, None))
     st.session_state.history.append(("assistant", answer, gemini_err))
     st.rerun()
+    
