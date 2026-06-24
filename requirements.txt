@@ -3,7 +3,7 @@ pypdf
 sentence-transformers
 scikit-learn
 gensim
-google-generativeai
+google-genai
 numpy
 nltk
 rank_bm25
