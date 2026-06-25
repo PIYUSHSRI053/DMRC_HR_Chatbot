@@ -75,7 +75,7 @@ def _get_secret(key, default=""):
 GEMINI_KEY   = _get_secret("GEMINI_API_KEY", "")
 # gemini-3.5-flash is the current fast model as of mid-2026. Override via
 # Streamlit secrets / .env if you need a different tier.
-GEMINI_MODEL = _get_secret("GEMINI_MODEL", "gemini-3.5-flash")
+GEMINI_MODEL = _get_secret("GEMINI_MODEL", "gemini-2.5-flash")
 
 # All 4 required files — chatbot_model.pkl downloaded from Drive if missing
 REQUIRED = [
